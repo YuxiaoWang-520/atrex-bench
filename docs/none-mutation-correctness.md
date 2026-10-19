@@ -49,19 +49,54 @@ declared mutations:
 {
   "benchmark_contract": {
     "correctness_tolerances": {
-      "output[0]": {"atol": 0.01, "rtol": 0.01},
-      "mutated_inputs.out": {"atol": 0.06, "rtol": 0.04}
+      "default": {"atol": 0.01, "rtol": 0.05, "max_mismatch_fraction": 0.0},
+      "mutated_inputs.out": {
+        "atol": 0.01,
+        "rtol": 0.05,
+        "max_mismatch_fraction": 0.001,
+        "max_rel_l2": 0.01
+      }
     },
     "correctness_min_cases": 6
   }
 }
 ```
 
-Paths must match a value actually compared by the evaluator; stale or
-misspelled paths fail evaluation. When `correctness_tolerances` is present it
-is authoritative and legacy global relative-L2 or mismatch-rate options cannot
-replace its elementwise checks. `correctness_min_cases` is a floor: a larger
-CLI-requested case count is retained.
+`default` applies only to floating return values under `output` without a
+path-specific policy. It does not apply to declared mutations; each mutation
+that needs a metadata-owned policy must use an explicit `mutated_inputs.<key>`
+path. The remaining keys must match a value actually compared; stale or
+misspelled paths fail evaluation. Every policy requires `atol` and `rtol`; omitted
+`max_mismatch_fraction` means zero and omitted `max_rel_l2` means no additional
+L2 bound. Fractions use units of one: **0.001 means 0.1%, not 0.001%**.
+
+For each tensor the elementwise condition preserves the historical
+`torch.allclose(reference, candidate)` direction:
+
+```
+bad = abs(candidate - reference) > atol + rtol * abs(candidate)
+sum(bad) <= floor(max_mismatch_fraction * tensor.numel())
+```
+
+The allowed count uses exact decimal-to-rational arithmetic, without rounding
+small tensors up to one permitted mismatch. Every tensor must pass; elements
+are not pooled across outputs or cases. With `max_rel_l2`, also require
+`norm(candidate-reference)/max(norm(reference), 1e-12) <= max_rel_l2`. A zero
+reference norm requires exact zero error for this additional bound. NaN/Inf are
+rejected before either metric. When metadata owns correctness, integer and
+boolean reference tensors remain on the exact-comparison path regardless of the
+floating policy. A floating-point or complex candidate for such a reference is
+rejected; compatible discrete candidate tensors are compared exactly. This
+metadata-mode rule is intentionally directional: a floating reference retains
+the existing tolerant comparison behavior for an integer candidate.
+
+Receipts include each tensor's effective tolerance, total element count,
+mismatched count and allowed count, as well as the existing error metrics. The
+receipt `mode` distinguishes exact comparison, elementwise comparison,
+elementwise comparison with an L2 conjunct, and the legacy relative-L2 mode.
+When metadata owns tolerances, legacy CLI/environment relative-L2 settings cannot
+replace them. The legacy global L2-only mode is otherwise unchanged.
+`correctness_min_cases` remains a floor on the CLI-requested case count.
 
 ## Scope and compatibility
 
