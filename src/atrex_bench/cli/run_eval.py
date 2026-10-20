@@ -75,6 +75,7 @@ from atrex_bench.eval.reward_hack import (
     check_thread_injection,
     snapshot_critical_functions,
 )
+from atrex_bench.shards import build_shape_selection, select_shape_ids
 from atrex_bench.utils import get_timestamp
 
 _SKIP_COMPILE_REASON = "Skipped because compile stage failed."
@@ -130,6 +131,14 @@ _RUNNER_CONFIG_KEYS = frozenset(
         "eval_mode",
         "input",
         "baseline_input",
+        "shape_ids",
+        "distribution",
+        "ray_max_workers",
+        "ray_shapes_per_shard",
+        "ray_max_shard_retries",
+        "ray_resources",
+        "ray_node_selector",
+        "ray_namespace",
         "reference_dir",
         "output",
         "checkpoint_dir",
@@ -247,6 +256,7 @@ def _derived_worker_wall_timeout_s(
     perf_timeout_s: int | float,
     num_correctness_cases: int,
     validation_mode: str = _VALIDATION_MODE_FULL,
+    shape_ids: list[str] | None = None,
 ) -> float | None:
     """OS-level wall-clock ceiling for the WHOLE ``--worker`` subprocess.
 
@@ -270,7 +280,7 @@ def _derived_worker_wall_timeout_s(
     if float(compile_timeout_s) <= 0:
         return None
     try:
-        shape_count = max(len(_shape_ids(reference_dir)), 1)
+        shape_count = max(len(_shape_ids(reference_dir, shape_ids)), 1)
     except Exception:  # noqa: BLE001 - unreadable shapes.json is reported elsewhere
         shape_count = 1
     shape_ceiling = _derived_shape_wall_timeout_s(
@@ -789,7 +799,12 @@ def _run_subprocess_with_live_stderr(
     clean up its own separately grouped children before the SIGKILL fallback.
     """
     started_at = time.monotonic()
-    process = subprocess.Popen(
+    popen = subprocess.Popen
+    if "ATREX_BENCH_RAY_LIFETIME_FD" in os.environ:
+        from atrex_bench._process_guard import supervised_popen
+
+        popen = supervised_popen
+    process = popen(
         cmd,
         cwd=cwd,
         stdout=subprocess.PIPE,
@@ -995,9 +1010,9 @@ def _load_shapes_json(reference_dir: Path) -> dict[str, dict[str, object]]:
     return raw
 
 
-def _shape_ids(reference_dir: Path) -> list[str]:
-    """Return all shape_ids declared in shapes.json, sorted by string order."""
-    return sorted(_load_shapes_json(reference_dir).keys())
+def _shape_ids(reference_dir: Path, selection: object = None) -> list[str]:
+    """Select original shape IDs in shapes.json string order."""
+    return select_shape_ids(sorted(_load_shapes_json(reference_dir)), selection)
 
 
 # ---------------------------------------------------------------------------
@@ -1192,10 +1207,15 @@ def _build_runner_config(
     graph_max_rel_l2: float | None = None,
     trust_mode: str = _TRUST_MODE_TRUSTED,
     require_clock_locked: bool = False,
+    shape_ids: list[str] | None = None,
+    perf_timeout_s: int | float = _DEFAULT_PERF_TIMEOUT_S,
+    compile_timeout_s: int | float = _DEFAULT_COMPILE_TIMEOUT_S,
+    collect_kernel_events: bool = True,
 ) -> dict[str, object]:
     return {
         "config_version": config_version,
         "mode": mode,
+        "shape_ids": shape_ids,
         "validation_mode": validation_mode,
         "atol": atol,
         "rtol": rtol,
@@ -1204,6 +1224,9 @@ def _build_runner_config(
         "warmup_iters": warmup_iters,
         "bench_iters": bench_iters,
         "candidate_timeout_s": candidate_timeout_s,
+        "perf_timeout_s": perf_timeout_s,
+        "compile_timeout_s": compile_timeout_s,
+        "collect_kernel_events": collect_kernel_events,
         "benchmark_mode": benchmark_mode,
         "cuda_graph_cache_flush_mb": cuda_graph_cache_flush_mb,
         "graph_atol": graph_atol,
@@ -1589,6 +1612,9 @@ def _build_eval_payload(
         "performance": {"shapes": _serialize_performance_shapes(performance_per_shape)},
         "error": error,
     }
+    payload["shape_selection"] = build_shape_selection(
+        reference_dir, candidate_path, runner_config, list(correctness_per_shape)
+    )
     # The flydsl ratio is only meaningful when we're evaluating a candidate
     # (not the torch.compile reference) AND when the per-shape kernel events
     # were actually collected (which is disabled via --skip-kernel-attribution).
@@ -2363,6 +2389,7 @@ def _run_torch_compile_worker(
     require_clock_locked: bool = False,
     compile_timeout_s: int | float = _DEFAULT_COMPILE_TIMEOUT_S,
     perf_timeout_s: int | float = _DEFAULT_PERF_TIMEOUT_S,
+    shape_ids: list[str] | None = None,
 ) -> dict[str, object]:
     """Benchmark torch.compile(reference) across all shapes and persist JSON."""
     worker_started = time.perf_counter()
@@ -2378,10 +2405,14 @@ def _run_torch_compile_worker(
         warmup_iters=warmup_iters,
         bench_iters=bench_iters,
         require_clock_locked=require_clock_locked,
+        shape_ids=shape_ids,
+        perf_timeout_s=perf_timeout_s,
+        compile_timeout_s=compile_timeout_s,
+        collect_kernel_events=False,
     )
     checkpoint_root = _resolve_checkpoint_root(artifact_dir, checkpoint_dir)
     eval_id = _eval_id()
-    shape_ids = _shape_ids(reference_dir)
+    shape_ids = _shape_ids(reference_dir, shape_ids)
     _log(
         f"[eval] start mode={_TORCH_COMPILE_EVAL_MODE} op={reference_dir.name} "
         f"eval_id={eval_id} shapes={len(shape_ids)} output={eval_output_path}"
@@ -2541,6 +2572,8 @@ def _run_eval_worker(
     graph_max_rel_l2: float | None = None,
     trust_mode: str = _TRUST_MODE_TRUSTED,
     validation_mode: str = _VALIDATION_MODE_FULL,
+    shape_ids: list[str] | None = None,
+    compile_timeout_s: int | float = _DEFAULT_COMPILE_TIMEOUT_S,
 ) -> dict[str, object]:
     """Run all stages across all shapes and persist the eval_result.json."""
     worker_started = time.perf_counter()
@@ -2565,13 +2598,17 @@ def _run_eval_worker(
         graph_max_rel_l2=graph_max_rel_l2,
         trust_mode=trust_mode,
         require_clock_locked=require_clock_locked,
+        shape_ids=shape_ids,
+        perf_timeout_s=perf_timeout_s,
+        compile_timeout_s=compile_timeout_s,
+        collect_kernel_events=collect_kernel_events,
     )
     checkpoint_root = _resolve_checkpoint_root(artifact_dir, checkpoint_dir)
     # One eval_id per worker invocation; reused for every incremental save
     # so a single eval has a single stable identity in the result store.
     eval_id = _eval_id()
 
-    shape_ids = _shape_ids(reference_dir)
+    shape_ids = _shape_ids(reference_dir, shape_ids)
     _log(
         f"[eval] start mode={_CANDIDATE_EVAL_MODE} op={reference_dir.name} "
         f"eval_id={eval_id} shapes={len(shape_ids)} output={eval_output_path}"
@@ -2820,7 +2857,10 @@ def _initial_fallback_payload(
     eval_id: str,
 ) -> dict[str, object]:
     """Fallback payload used before any stage runs (e.g. pre-flight failure)."""
-    shape_ids = _shape_ids(reference_dir) if (reference_dir / "shapes.json").is_file() else []
+    shape_ids = (
+        _shape_ids(reference_dir, runner_config.get("shape_ids"))
+        if (reference_dir / "shapes.json").is_file() else []
+    )
     return _build_eval_payload(
         reference_dir=reference_dir,
         candidate_path=candidate_path,
@@ -2849,7 +2889,10 @@ def _initial_torch_compile_fallback_payload(
     eval_id: str,
 ) -> dict[str, object]:
     """Fallback payload for torch-compile reference mode before stages run."""
-    shape_ids = _shape_ids(reference_dir) if (reference_dir / "shapes.json").is_file() else []
+    shape_ids = (
+        _shape_ids(reference_dir, runner_config.get("shape_ids"))
+        if (reference_dir / "shapes.json").is_file() else []
+    )
     return _build_eval_payload(
         reference_dir=reference_dir,
         candidate_path=None,
@@ -2886,6 +2929,7 @@ def _run_torch_compile_eval_process(
     require_clock_locked: bool = False,
     compile_timeout_s: int | float = _DEFAULT_COMPILE_TIMEOUT_S,
     perf_timeout_s: int | float = _DEFAULT_PERF_TIMEOUT_S,
+    shape_ids: list[str] | None = None,
 ) -> dict[str, object]:
     """Benchmark torch.compile(reference) across all shapes."""
     reference_dir = reference_dir.resolve()
@@ -2910,6 +2954,10 @@ def _run_torch_compile_eval_process(
         warmup_iters=warmup_iters,
         bench_iters=bench_iters,
         require_clock_locked=require_clock_locked,
+        shape_ids=shape_ids,
+        perf_timeout_s=perf_timeout_s,
+        compile_timeout_s=compile_timeout_s,
+        collect_kernel_events=False,
     )
     environment = _build_environment(clock_locked=clock_locked)
 
@@ -2953,6 +3001,8 @@ def _run_torch_compile_eval_process(
         "--artifact-dir",
         str(artifact_dir),
     ]
+    if shape_ids is not None:
+        worker_command.extend(["--shape-ids", ",".join(shape_ids)])
     if clock_locked:
         worker_command.append("--clock-locked")
     if require_clock_locked:
@@ -3208,13 +3258,14 @@ def _build_abba_payload(
     eval_id: str,
     runs: list[dict[str, object]],
     error: str | None = None,
+    baseline_path: Path | None = None,
 ) -> dict[str, object]:
     aggregate: dict[str, object] | None = None
     aggregate_error = error
     if aggregate_error is None:
         aggregate, aggregate_error = _aggregate_abba_runs(
             runs,
-            _shape_ids(reference_dir),
+            _shape_ids(reference_dir, runner_config.get("shape_ids")),
         )
     status = "passed" if aggregate_error is None else "failed"
     abba = {
@@ -3238,6 +3289,11 @@ def _build_abba_payload(
             }
         },
         "abba": abba,
+        "shape_selection": build_shape_selection(
+            reference_dir, candidate_path, runner_config,
+            _shape_ids(reference_dir, runner_config.get("shape_ids")),
+            baseline_path=baseline_path,
+        ),
         "error": aggregate_error,
     }
 
@@ -3295,6 +3351,7 @@ def _run_abba_eval_process(
     graph_min_cosine: float | None,
     graph_max_rel_l2: float | None,
     trust_mode: str,
+    shape_ids: list[str] | None = None,
 ) -> dict[str, object]:
     kernel_name = _kernel_name(reference_dir, candidate_path)
     artifact_dir, eval_output_path = _build_artifact_paths(
@@ -3321,6 +3378,10 @@ def _run_abba_eval_process(
         graph_max_rel_l2=graph_max_rel_l2,
         trust_mode=trust_mode,
         require_clock_locked=require_clock_locked,
+        shape_ids=shape_ids,
+        perf_timeout_s=perf_timeout_s,
+        compile_timeout_s=compile_timeout_s,
+        collect_kernel_events=collect_kernel_events,
     )
     environment = _build_environment(clock_locked=clock_locked)
     eval_id = _eval_id()
@@ -3333,6 +3394,7 @@ def _run_abba_eval_process(
         eval_id=eval_id,
         runs=runs,
         error=_PENDING_EVAL_REASON,
+        baseline_path=baseline_path,
     )
     _save_eval_json(initial_payload, eval_output_path)
 
@@ -3362,6 +3424,7 @@ def _run_abba_eval_process(
             eval_id=eval_id,
             runs=runs,
             error=traceback.format_exc(),
+            baseline_path=baseline_path,
         )
         _save_eval_json(failure_payload, eval_output_path)
         return failure_payload
@@ -3409,6 +3472,7 @@ def _run_abba_eval_process(
             trust_mode=trust_mode,
             validation_mode=_VALIDATION_MODE_FULL,
             artifact_dir_override=run_dir,
+            shape_ids=shape_ids,
         )
         runs.append(
             {
@@ -3428,6 +3492,7 @@ def _run_abba_eval_process(
             eval_id=eval_id,
             runs=runs,
             error=partial_error,
+            baseline_path=staged_baseline_path,
         )
         _save_eval_json(payload, eval_output_path)
     return payload
@@ -3461,6 +3526,7 @@ def _run_eval_process(
     trust_mode: str = _TRUST_MODE_TRUSTED,
     validation_mode: str = _VALIDATION_MODE_FULL,
     artifact_dir_override: Path | None = None,
+    shape_ids: list[str] | None = None,
 ) -> dict[str, object]:
     """Run the full pipeline; always persist a valid eval_result.json."""
     input_path = input_path.resolve()
@@ -3498,6 +3564,10 @@ def _run_eval_process(
         graph_max_rel_l2=graph_max_rel_l2,
         trust_mode=trust_mode,
         require_clock_locked=require_clock_locked,
+        shape_ids=shape_ids,
+        perf_timeout_s=perf_timeout_s,
+        compile_timeout_s=compile_timeout_s,
+        collect_kernel_events=collect_kernel_events,
     )
     environment = _build_environment(clock_locked=clock_locked)
 
@@ -3545,6 +3615,8 @@ def _run_eval_process(
         str(candidate_timeout_s),
         "--perf-timeout-s",
         str(perf_timeout_s),
+        "--compile-timeout-s",
+        str(compile_timeout_s),
         "--benchmark-mode",
         benchmark_mode,
         "--cuda-graph-cache-flush-mb",
@@ -3565,6 +3637,8 @@ def _run_eval_process(
         worker_command.extend(["--graph-min-cosine", str(graph_min_cosine)])
     if graph_max_rel_l2 is not None:
         worker_command.extend(["--graph-max-rel-l2", str(graph_max_rel_l2)])
+    if shape_ids is not None:
+        worker_command.extend(["--shape-ids", ",".join(shape_ids)])
     if clock_locked:
         worker_command.append("--clock-locked")
     if require_clock_locked:
@@ -3590,6 +3664,7 @@ def _run_eval_process(
         perf_timeout_s=perf_timeout_s,
         num_correctness_cases=num_correctness_cases,
         validation_mode=validation_mode,
+        shape_ids=shape_ids,
     )
     compile_ready_path = artifact_dir / _COMPILE_READY_FILENAME
     compile_ready_path.unlink(missing_ok=True)
@@ -3832,6 +3907,7 @@ def run_torch_compile_eval(
     clock_lock_config: ClockLockConfig | None = None,
     compile_timeout_s: int | float = _DEFAULT_COMPILE_TIMEOUT_S,
     perf_timeout_s: int | float = _DEFAULT_PERF_TIMEOUT_S,
+    shape_ids: list[str] | None = None,
 ) -> dict[str, object]:
     """Run torch.compile evaluation under one optional parent clock lock."""
     reference_dir = reference_dir.resolve()
@@ -3860,6 +3936,10 @@ def run_torch_compile_eval(
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             require_clock_locked=True,
+            shape_ids=shape_ids,
+            perf_timeout_s=perf_timeout_s,
+            compile_timeout_s=compile_timeout_s,
+            collect_kernel_events=False,
         )
         initial = _initial_torch_compile_fallback_payload(
             reference_dir=reference_dir,
@@ -3885,6 +3965,7 @@ def run_torch_compile_eval(
             require_clock_locked=effective_require_clock_locked,
             compile_timeout_s=compile_timeout_s,
             perf_timeout_s=perf_timeout_s,
+            shape_ids=shape_ids,
         )
 
     return _evaluate_with_clock_policy(
@@ -3926,6 +4007,7 @@ def run_abba_eval(
     graph_max_rel_l2: float | None = None,
     trust_mode: str = _TRUST_MODE_TRUSTED,
     clock_lock_config: ClockLockConfig | None = None,
+    shape_ids: list[str] | None = None,
 ) -> dict[str, object]:
     """Run a complete A-B-B-A comparison under one optional clock lock."""
     baseline_path = baseline_path.resolve()
@@ -3964,6 +4046,10 @@ def run_abba_eval(
             graph_max_rel_l2=graph_max_rel_l2,
             trust_mode=trust_mode,
             require_clock_locked=True,
+            shape_ids=shape_ids,
+            perf_timeout_s=perf_timeout_s,
+            compile_timeout_s=compile_timeout_s,
+            collect_kernel_events=collect_kernel_events,
         )
         return _build_abba_payload(
             reference_dir=reference_dir,
@@ -3973,6 +4059,7 @@ def run_abba_eval(
             eval_id=_eval_id(),
             runs=[],
             error=error,
+            baseline_path=baseline_path,
         )
 
     def evaluate(
@@ -4005,6 +4092,7 @@ def run_abba_eval(
             graph_min_cosine=graph_min_cosine,
             graph_max_rel_l2=graph_max_rel_l2,
             trust_mode=trust_mode,
+            shape_ids=shape_ids,
         )
 
     return _evaluate_with_clock_policy(
@@ -4046,6 +4134,7 @@ def run_eval(
     trust_mode: str = _TRUST_MODE_TRUSTED,
     clock_lock_config: ClockLockConfig | None = None,
     validation_mode: str = _VALIDATION_MODE_FULL,
+    shape_ids: list[str] | None = None,
 ) -> dict[str, object]:
     """Run candidate evaluation under one optional parent clock lock."""
     input_path = input_path.resolve()
@@ -4084,6 +4173,10 @@ def run_eval(
             graph_max_rel_l2=graph_max_rel_l2,
             trust_mode=trust_mode,
             require_clock_locked=True,
+            shape_ids=shape_ids,
+            perf_timeout_s=perf_timeout_s,
+            compile_timeout_s=compile_timeout_s,
+            collect_kernel_events=collect_kernel_events,
         )
         initial = _initial_fallback_payload(
             reference_dir=reference_dir,
@@ -4124,6 +4217,7 @@ def run_eval(
             graph_max_rel_l2=graph_max_rel_l2,
             trust_mode=trust_mode,
             validation_mode=validation_mode,
+            shape_ids=shape_ids,
         )
 
     return _evaluate_with_clock_policy(
@@ -4577,6 +4671,20 @@ def main() -> None:
         default=None,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--shape-ids", default=None,
+        help="Comma-separated original shape IDs or @JSON/text file; omitted selects all",
+    )
+    parser.add_argument("--distribution", choices=("local", "ray_data"), default=None,
+                        help="Local evaluation or optional Ray Data shape distribution")
+    parser.add_argument("--ray-max-workers", type=int, default=None,
+                        help="Maximum Ray GPU workers (positive integer; defaults to shard count)")
+    parser.add_argument("--ray-shapes-per-shard", type=int, default=None,
+                        help="Original shapes per Ray work item (default 1)")
+    parser.add_argument("--ray-max-shard-retries", type=int, default=None,
+                        help="Worker/node failure retries per shard (0-3; default 3)")
+    parser.add_argument("--ray-namespace", default=None,
+                        help="Standalone Ray namespace; gateway attempt namespace takes precedence")
     args = parser.parse_args()
     cli_validation_mode = args.validation_mode
     cli_baseline_input = args.baseline_input
@@ -4600,6 +4708,9 @@ def main() -> None:
             "reference_dir",
             cli_value=args.reference_dir,
             config=runner_file_config,
+        )
+        args.shape_ids = _resolve_runner_option(
+            "shape_ids", cli_value=args.shape_ids, config=runner_file_config, default=None
         )
         args.output = _resolve_path_option(
             "output",
@@ -4651,6 +4762,11 @@ def main() -> None:
         raise SystemExit("baseline_input requires eval_mode=abba.")
     if args.reference_dir is None:
         raise SystemExit("reference_dir is required via --reference-dir or config.")
+    try:
+        if args.shape_ids is not None:
+            args.shape_ids = _shape_ids(args.reference_dir, args.shape_ids)
+    except (TypeError, ValueError, OSError) as error:
+        raise SystemExit(str(error)) from error
 
     args.atol = float(
         _resolve_runner_option(
@@ -4830,6 +4946,46 @@ def main() -> None:
     )
     if args.trust_mode not in {_TRUST_MODE_TRUSTED, _TRUST_MODE_UNTRUSTED}:
         raise SystemExit("trust_mode must be one of: trusted, untrusted")
+    from atrex_bench.ray_data import evaluate_ray_data, validate_distribution
+
+    distributed_config = dict(runner_file_config)
+    for name in _RUNNER_CONFIG_KEYS:
+        value = getattr(args, name, None)
+        if value is not None:
+            distributed_config[name] = str(value) if isinstance(value, Path) else value
+    distributed_config["eval_mode"] = eval_mode
+    distributed_config["clock_lock_mode"] = clock_lock_config.mode
+    try:
+        distribution = validate_distribution(distributed_config)
+    except (TypeError, ValueError) as error:
+        raise SystemExit(str(error)) from error
+    worker_mode = (args.worker or args.single_shape_worker or args.torch_compile_worker
+                   or args.torch_compile_shape_worker)
+    if distribution == "ray_data":
+        if worker_mode:
+            raise SystemExit("ray_data is only valid for top-level evaluation")
+        if args.output is None:
+            raise SystemExit("output is required via --output or config")
+        if eval_mode != _TORCH_COMPILE_EVAL_MODE and args.input is None:
+            raise SystemExit("input is required via --input or config")
+        # The CPU driver never enters local clock management. Each actor runs
+        # the ordinary top-level evaluator against its own assigned GPU.
+        from atrex_bench import AtrexConfigError
+
+        try:
+            with _sigterm_as_system_exit():
+                payload = evaluate_ray_data(distributed_config)
+        except AtrexConfigError as error:
+            raise SystemExit(str(error)) from error
+        kernel_name = _kernel_name(args.reference_dir, args.input or args.reference_dir)
+        _, result_path = _build_artifact_paths(output_root=args.output,
+                                              kernel_name=kernel_name,
+                                              timestamp=get_timestamp())
+        _save_eval_json(payload, result_path)
+        if args.sdk_result_path_output is not None:
+            _save_text_atomic(str(result_path.resolve()), args.sdk_result_path_output)
+        print(f"[OUTPUT] {result_path}")
+        raise SystemExit(0 if _payload_overall_passed(payload) else 1)
     if args.correctness_max_rel_l2 is not None:
         os.environ[CORRECTNESS_MAX_REL_L2_ENV] = str(
             args.correctness_max_rel_l2
@@ -4919,6 +5075,7 @@ def main() -> None:
             require_clock_locked=args.require_clock_locked,
             compile_timeout_s=args.compile_timeout_s,
             perf_timeout_s=args.perf_timeout_s,
+            shape_ids=args.shape_ids,
         )
         raise SystemExit(0)
 
@@ -4943,6 +5100,7 @@ def main() -> None:
             collect_kernel_events=not args.skip_kernel_attribution,
             candidate_timeout_s=args.candidate_timeout_s,
             perf_timeout_s=args.perf_timeout_s,
+            compile_timeout_s=args.compile_timeout_s,
             benchmark_mode=args.benchmark_mode,
             cuda_graph_cache_flush_mb=args.cuda_graph_cache_flush_mb,
             graph_atol=args.graph_atol,
@@ -4951,6 +5109,7 @@ def main() -> None:
             graph_max_rel_l2=args.graph_max_rel_l2,
             trust_mode=args.trust_mode,
             validation_mode=args.validation_mode,
+            shape_ids=args.shape_ids,
         )
         raise SystemExit(0)
 
@@ -4976,6 +5135,7 @@ def main() -> None:
             clock_lock_config=clock_lock_config,
             compile_timeout_s=args.compile_timeout_s,
             perf_timeout_s=args.perf_timeout_s,
+            shape_ids=args.shape_ids,
         )
         kernel_name = _kernel_name(args.reference_dir, args.reference_dir / "reference.py")
         _, eval_output_path = _build_artifact_paths(
@@ -5025,6 +5185,7 @@ def main() -> None:
             graph_min_cosine=args.graph_min_cosine,
             graph_max_rel_l2=args.graph_max_rel_l2,
             trust_mode=args.trust_mode,
+            shape_ids=args.shape_ids,
         )
         kernel_name = _kernel_name(args.reference_dir, args.input)
         _, eval_output_path = _build_artifact_paths(
@@ -5073,6 +5234,7 @@ def main() -> None:
         graph_max_rel_l2=args.graph_max_rel_l2,
         trust_mode=args.trust_mode,
         validation_mode=args.validation_mode,
+        shape_ids=args.shape_ids,
     )
     kernel_name = _kernel_name(args.reference_dir, args.input)
     _, eval_output_path = _build_artifact_paths(
