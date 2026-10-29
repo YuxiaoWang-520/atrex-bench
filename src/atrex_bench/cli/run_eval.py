@@ -1150,9 +1150,19 @@ def _ptl_state() -> str | None:
     return None
 
 
-def _build_environment(*, clock_locked: bool) -> dict[str, object]:
-    """Build the environment block per docs/data_schema.md §七 7.5."""
-    gpu_name, gpu_arch = _gpu_info()
+def _build_environment(
+    *, clock_locked: bool, collect_device: bool = False
+) -> dict[str, object]:
+    """Build the environment block per docs/data_schema.md §七 7.5.
+
+    Device queries are opt-in for workers. The public field contract is also
+    documented in docs/run_eval_cli_contract.md under Environment Metadata.
+
+    A supervisor's fallback metadata is provisional. The GPU worker replaces it in
+    eval_result.json, so querying a device here only creates an extra context that
+    can invalidate ACU's CE counters across the nested process chain.
+    """
+    gpu_name, gpu_arch = _gpu_info() if collect_device else (None, None)
     versions = get_core_package_versions()
     clock_status = get_clock_lock_status()
     clock_source = clock_status.source
@@ -1161,13 +1171,13 @@ def _build_environment(*, clock_locked: bool) -> dict[str, object]:
     env: dict[str, object] = {
         "gpu_name": gpu_name,
         "gpu_arch": gpu_arch,
-        "accelerator_backend": get_accelerator_backend(),
-        "driver_version": _driver_version(),
+        "accelerator_backend": get_accelerator_backend() if collect_device else None,
+        "driver_version": _driver_version() if collect_device else None,
         "runtime_version": _runtime_version(),
         "clock_locked": clock_locked or clock_status.locked,
         "clock_lock_detected": clock_status.locked,
         "clock_lock_source": clock_source,
-        "PTL_STATE": _ptl_state(),
+        "PTL_STATE": _ptl_state() if collect_device else None,
         "torch_version": versions.get("torch"),
         "python_version": get_python_version(),
     }
@@ -2398,7 +2408,7 @@ def _run_torch_compile_worker(
     """Benchmark torch.compile(reference) across all shapes and persist JSON."""
     worker_started = time.perf_counter()
     eval_output_path = artifact_dir / "eval_result.json"
-    environment = _build_environment(clock_locked=clock_locked)
+    environment = _build_environment(clock_locked=clock_locked, collect_device=True)
     runner_config = _build_runner_config(
         config_version=config_version,
         mode=_TORCH_COMPILE_EVAL_MODE,
@@ -2583,7 +2593,7 @@ def _run_eval_worker(
     worker_started = time.perf_counter()
     candidate_path = input_path
     eval_output_path = artifact_dir / "eval_result.json"
-    environment = _build_environment(clock_locked=clock_locked)
+    environment = _build_environment(clock_locked=clock_locked, collect_device=True)
     runner_config = _build_runner_config(
         config_version=config_version,
         mode=_CANDIDATE_EVAL_MODE,
@@ -2963,7 +2973,7 @@ def _run_torch_compile_eval_process(
         compile_timeout_s=compile_timeout_s,
         collect_kernel_events=False,
     )
-    environment = _build_environment(clock_locked=clock_locked)
+    environment = _build_environment(clock_locked=clock_locked, collect_device=False)
 
     initial_payload = _initial_torch_compile_fallback_payload(
         reference_dir=reference_dir,
@@ -3387,7 +3397,7 @@ def _run_abba_eval_process(
         compile_timeout_s=compile_timeout_s,
         collect_kernel_events=collect_kernel_events,
     )
-    environment = _build_environment(clock_locked=clock_locked)
+    environment = _build_environment(clock_locked=clock_locked, collect_device=False)
     eval_id = _eval_id()
     runs: list[dict[str, object]] = []
     initial_payload = _build_abba_payload(
@@ -3478,6 +3488,12 @@ def _run_abba_eval_process(
             artifact_dir_override=run_dir,
             shape_ids=shape_ids,
         )
+        if not runs:
+            # Reuse the first leg's metadata without probing the supervisor's
+            # device. Copy it so top-level clock annotations cannot alter the leg.
+            first_environment = result.get("environment")
+            if isinstance(first_environment, dict):
+                environment = dict(first_environment)
         runs.append(
             {
                 **step,
@@ -3573,7 +3589,7 @@ def _run_eval_process(
         compile_timeout_s=compile_timeout_s,
         collect_kernel_events=collect_kernel_events,
     )
-    environment = _build_environment(clock_locked=clock_locked)
+    environment = _build_environment(clock_locked=clock_locked, collect_device=False)
 
     initial_payload = _initial_fallback_payload(
         reference_dir=reference_dir,
@@ -3948,7 +3964,7 @@ def run_torch_compile_eval(
         initial = _initial_torch_compile_fallback_payload(
             reference_dir=reference_dir,
             runner_config=runner_config,
-            environment=_build_environment(clock_locked=False),
+            environment=_build_environment(clock_locked=False, collect_device=False),
             eval_id=_eval_id(),
         )
         return _annotate_failure_payload(initial, error)
@@ -4059,7 +4075,7 @@ def run_abba_eval(
             reference_dir=reference_dir,
             candidate_path=candidate_path,
             runner_config=runner_config,
-            environment=_build_environment(clock_locked=False),
+            environment=_build_environment(clock_locked=False, collect_device=False),
             eval_id=_eval_id(),
             runs=[],
             error=error,
@@ -4186,7 +4202,7 @@ def run_eval(
             reference_dir=reference_dir,
             candidate_path=input_path,
             runner_config=runner_config,
-            environment=_build_environment(clock_locked=False),
+            environment=_build_environment(clock_locked=False, collect_device=False),
             eval_id=_eval_id(),
         )
         return _annotate_failure_payload(initial, error)
